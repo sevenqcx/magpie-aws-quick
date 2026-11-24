@@ -203,6 +203,34 @@ test('huge system prompt + large toolset still delivers the user question', asyn
   assert.ok(frameBytes(p.thread_id, p) <= UPSTREAM_TEXT_LIMIT)
 })
 
+test('multi-message first turn with oversized skill reminder still delivers the user prompt', async () => {
+  const tools = Array.from({ length: 25 }, (_, i) => ({
+    type: 'function',
+    function: {
+      name: `tool_${i}`,
+      description: `does thing ${i} `.padEnd(400, 'd'),
+      parameters: { type: 'object', properties: { arg: { type: 'string' } } },
+    },
+  }))
+  await req({
+    model: 'fast',
+    messages: [
+      { role: 'system', content: 'S'.repeat(40 * 1024) },
+      { role: 'user', content: '# Long-term Memory\nUse reme_search.' },
+      { role: 'user', content: 'USER_LINK_QUESTION https://x.com/example/status/123 这个怎么用？' },
+      { role: 'user', content: '<system-reminder>cwd=/workspace</system-reminder>' },
+      { role: 'user', content: '<system-reminder><available_skills>' + 'skill-entry '.repeat(2500) + '</available_skills></system-reminder>' },
+      { role: 'user', content: 'Time sampled while preparing turn 1: 2026-11-24T17:19:15+08:00' },
+    ],
+    tools,
+  })
+  const p = fake.state.userMessages.at(-1).payload
+  assert.ok(p.text.includes('USER_LINK_QUESTION https://x.com/example/status/123 这个怎么用？'))
+  assert.ok(p.text.includes('[Client tool calling]'))
+  assert.ok(!p.text.includes('earlier message(s) omitted'))
+  assert.ok(frameBytes(p.thread_id, p) <= UPSTREAM_TEXT_LIMIT)
+})
+
 test('thread reuse: extended conversation continues the same thread with delta only', async () => {
   const sessions = createSessionStore()
   const u1 = { role: 'user', content: 'remember teal' }

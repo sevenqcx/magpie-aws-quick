@@ -299,3 +299,113 @@ test('renderDelta gives the current turn head and tail, not just the head', () =
   assert.ok(out.includes('TASK-HEAD') && out.includes('TASK-TAIL'))
   assert.ok(byteLen(out) <= 60 * 1024)
 })
+
+test('renderTranscript preserves multi-message first turn when a sibling <system-reminder> overflows', () => {
+  const messages = [
+    { role: 'user', content: '# Long-term Memory\nUse reme_search.' },
+    { role: 'user', content: 'https://x.com/sunbelife/status/2124731346245570760 这个怎么用？' },
+    { role: 'user', content: '<system-reminder>ENV_INFO cwd=/tmp</system-reminder>' },
+    { role: 'user', content: '<system-reminder>SKILLS_HEAD ' + 's'.repeat(25 * 1024) + ' SKILLS_TAIL</system-reminder>' },
+    { role: 'user', content: 'Time sampled while preparing turn 1: 2026-11-24T17:19:15+08:00' },
+  ]
+  const stats = {}
+  const out = renderTranscript(messages, '', { maxBytes: 16 * 1024, stats })
+  assert.ok(stats.truncated)
+  assert.ok(byteLen(out) <= 16 * 1024)
+  assert.ok(out.includes('Long-term Memory'))
+  assert.ok(out.includes('https://x.com/sunbelife/status/2124731346245570760 这个怎么用？'))
+  assert.ok(out.includes('ENV_INFO cwd=/tmp'))
+  assert.ok(out.includes('SKILLS_HEAD') && out.includes('SKILLS_TAIL'))
+  assert.ok(out.includes('Time sampled while preparing turn 1'))
+  assert.ok(!out.includes('[conversation so far]'))
+  assert.ok(!out.includes('earlier message(s) omitted'))
+  assert.ok(byteLen(out) > 14 * 1024, 'reminder should use leftover budget rather than hard-capping to 2 KB')
+})
+
+test('renderTranscript water-fills multi-message first turn when a non-reminder sibling overflows', () => {
+  const messages = [
+    { role: 'user', content: '# Long-term Memory' },
+    { role: 'user', content: 'ACTUAL_USER_QUESTION' },
+    { role: 'user', content: '<skill_content>SKILL_START ' + 'k'.repeat(25 * 1024) + ' SKILL_END</skill_content>' },
+    { role: 'user', content: 'Time sampled: 17:19' },
+  ]
+  const stats = {}
+  const out = renderTranscript(messages, '', { maxBytes: 10 * 1024, stats })
+  assert.ok(stats.truncated)
+  assert.ok(byteLen(out) <= 10 * 1024)
+  assert.ok(out.includes('# Long-term Memory'))
+  assert.ok(out.includes('ACTUAL_USER_QUESTION'))
+  assert.ok(out.includes('SKILL_START') && out.includes('SKILL_END'))
+  assert.ok(out.includes('Time sampled: 17:19'))
+  assert.ok(!out.includes('earlier message(s) omitted'))
+})
+
+test('renderTranscript drops history before squeezing a multi-message current turn', () => {
+  const messages = [
+    { role: 'user', content: 'PINNED_SUMMARY ' + 'p'.repeat(4 * 1024) },
+    { role: 'assistant', content: 'OLD_REPLY_1' },
+    { role: 'user', content: 'OLD_FOLLOWUP' },
+    { role: 'assistant', content: 'OLD_REPLY_2 ' + 'o'.repeat(20 * 1024) },
+    { role: 'user', content: 'CURRENT_USER_PROMPT' },
+    { role: 'user', content: '<system-reminder>REM_HEAD ' + 'r'.repeat(25 * 1024) + ' REM_TAIL</system-reminder>' },
+    { role: 'user', content: 'Time sampled: turn 3' },
+  ]
+  const stats = {}
+  const out = renderTranscript(messages, '', { maxBytes: 14 * 1024, stats })
+  assert.ok(stats.truncated)
+  assert.ok(byteLen(out) <= 14 * 1024)
+  assert.ok(out.includes('PINNED_SUMMARY'))
+  assert.ok(!out.includes('OLD_REPLY_2'))
+  assert.ok(out.includes('CURRENT_USER_PROMPT'))
+  assert.ok(out.includes('REM_HEAD') && out.includes('REM_TAIL'))
+  assert.ok(out.includes('Time sampled: turn 3'))
+})
+
+test('renderDelta squeezes <system-reminder> siblings before dropping the user question', () => {
+  const delta = [
+    { role: 'user', content: 'FOLLOWUP_QUESTION' },
+    { role: 'user', content: '<system-reminder>ENV_SMALL</system-reminder>' },
+    { role: 'user', content: '<system-reminder>HUGE_HEAD ' + 'h'.repeat(25 * 1024) + ' HUGE_TAIL</system-reminder>' },
+    { role: 'user', content: 'Time sampled: turn 2' },
+  ]
+  const stats = {}
+  const out = renderDelta(delta, { maxBytes: 12 * 1024, stats })
+  assert.ok(stats.truncated)
+  assert.ok(byteLen(out) <= 12 * 1024)
+  assert.ok(out.includes('FOLLOWUP_QUESTION'))
+  assert.ok(out.includes('ENV_SMALL'))
+  assert.ok(out.includes('HUGE_HEAD') && out.includes('HUGE_TAIL'))
+  assert.ok(out.includes('Time sampled: turn 2'))
+  assert.ok(!out.includes('earlier message(s) omitted'))
+})
+
+test('renderDelta shrinks <system-reminder> without starving fresh tool results', () => {
+  const delta = [
+    { role: 'tool', tool_call_id: 'c1', name: 'read', content: 'T1_HEAD ' + 'a'.repeat(12 * 1024) + ' T1_TAIL' },
+    { role: 'tool', tool_call_id: 'c2', name: 'read', content: 'T2_HEAD ' + 'b'.repeat(12 * 1024) + ' T2_TAIL' },
+    { role: 'user', content: 'CHECK_BOTH_TOOLS' },
+    { role: 'user', content: '<system-reminder>REM_HEAD ' + 'r'.repeat(25 * 1024) + ' REM_TAIL</system-reminder>' },
+  ]
+  const out = renderDelta(delta, { maxBytes: 16 * 1024 })
+  assert.ok(byteLen(out) <= 16 * 1024)
+  assert.ok(out.includes('CHECK_BOTH_TOOLS'))
+  assert.ok(out.includes('T1_HEAD') && out.includes('T1_TAIL'))
+  assert.ok(out.includes('T2_HEAD') && out.includes('T2_TAIL'))
+  assert.ok(out.includes('a'.repeat(4000)), 'tool 1 keeps substantial output instead of being starved by reminder')
+  assert.ok(out.includes('b'.repeat(4000)), 'tool 2 keeps substantial output instead of being starved by reminder')
+  assert.ok(!out.includes('earlier message(s) omitted'))
+})
+
+test('renderDelta shrinks huge trailing non-reminder sibling instead of dropping short question', () => {
+  const delta = [
+    { role: 'user', content: 'SHORT_PROMPT' },
+    { role: 'user', content: '<skill_content>S_HEAD ' + 'x'.repeat(20 * 1024) + ' S_TAIL</skill_content>' },
+    { role: 'user', content: 'Time sampled: turn 2' },
+  ]
+  const out = renderDelta(delta, { maxBytes: 10 * 1024 })
+  assert.ok(byteLen(out) <= 10 * 1024)
+  assert.ok(out.includes('SHORT_PROMPT'))
+  assert.ok(out.includes('S_HEAD') && out.includes('S_TAIL'))
+  assert.ok(out.includes('Time sampled: turn 2'))
+  assert.ok(!out.includes('earlier message(s) omitted'))
+})
